@@ -1,4 +1,4 @@
-/* method 6: array implementaion of prev. algorithm */
+/* method 7: bug fixes with FS of prev. algorithm */
  
 #undef __KERNEL__
 #define __KERNEL__
@@ -27,7 +27,7 @@
 
 /* starting from IW? */
 #define INVALID_PIPEACK_VALUE 		-1
-#define INVALID_PIPEACK_RETURN_VALUE 	TCP_INFINITE_SSTHRESH
+#define INVALID_PIPEACK_RETURN_VALUE 	-1
 #define PIPEACK_INIT  			TCP_INFINITE_SSTHRESH
 #define TCP_RESTART_WINDOW		1
 #define FIVEMINS  			(HZ*300)
@@ -155,7 +155,7 @@ static int32_t get_pipeack_value(struct newcwv *nc){
 
 /* 	returns the usable pipeack value*/
 int32_t get_pipeack_variable( struct newcwv* nc){
-	return (nc->pipeack_variable == INVALID_PIPEACK_VALUE)? TCP_INFINITE_SSTHRESH : nc->pipeack_variable;
+	return (nc->pipeack_variable == INVALID_PIPEACK_VALUE)? INVALID_PIPEACK_RETURN_VALUE : nc->pipeack_variable;
 }
 
 /*
@@ -190,7 +190,7 @@ static void printstat(struct sock* sk, int level, int in_flight){
 	struct newcwv *nc = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
 	
-	printk("CWVDEBUG_%d: snd_una %u  snd_nxt %u pipeack %d cwnd %u  is_valid %u flight %u ssthresh %u PMP %u PSP %u sport %u dport %u \n",
+	printk("CWVDEBUG_%d: snd_una %u  snd_nxt %u pipeack %d cwnd %u  is_valid %u flight %u ssthresh %u PMP %u PSP %u sport %u dport %u\n",
 	        level,
 		tp->snd_una,
 		tp->snd_nxt,
@@ -209,7 +209,10 @@ static void printstat(struct sock* sk, int level, int in_flight){
 /*	original proposal for validity check 	*/
 static inline bool tcp_is_in_vp(struct tcp_sock*tp, int32_t pa)
 {
-	return (pa<<1) > (tp->snd_cwnd * tp->mss_cache);
+	if (pa == INVALID_PIPEACK_RETURN_VALUE)
+	 return true;
+	else
+	 return ( (pa<<1) >= (tp->snd_cwnd * tp->mss_cache) ) ;
 }
 
 
@@ -313,7 +316,9 @@ static void tcp_newcwv_init(struct sock *sk)
 	
 	nc->prev_snd_una = tp->snd_una;
 	nc->prev_snd_nxt = tp->snd_nxt;
-		
+	
+	//printk("start_zia %u %u\n", tp->write_seq, sk->sk_sndbuf);
+	
 	nc->cwnd_valid_ts = tcp_time_stamp;
 	
 	nc->is_valid = 1;
@@ -327,7 +332,7 @@ static void tcp_newcwv_init(struct sock *sk)
 		nc->pipeack[i] = INVALID_PIPEACK_VALUE;
 		nc->time_stamp[i]= 0;
 	}
-	nc->pipeack_variable = PIPEACK_INIT;
+	nc->pipeack_variable = INVALID_PIPEACK_VALUE;
 	nc->cwnd_before_recovery=0;
 	
 	printk("CWVDEBUG_0: with draft OCT 2013: method 5 new pipeACK array %d PSP : %u PMP: %u\n", NO_OF_BINS, PSP, PMP);
@@ -356,7 +361,7 @@ static void tcp_newcwv_reset(struct sock *sk)
 		nc->pipeack[i]= INVALID_PIPEACK_VALUE;
 		nc->time_stamp[i] = 0;
 	}
-	nc->pipeack_variable = PIPEACK_INIT;
+	nc->pipeack_variable = INVALID_PIPEACK_VALUE;
 }
 
 
@@ -367,14 +372,16 @@ static void tcp_newcwv_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
 
 	nc->prior_in_flight = in_flight;
 	nc->prior_retrans = tp->total_retrans;
+
+	printk("write_zia %u\n",tp->write_seq);
 	
 	update_pipeack(sk);
 
 	printstat(sk,1,in_flight);
 
 	/* Check if cwnd is validated */
-	//if ( !(nc->is_valid) && !tcp_is_cwnd_limited(sk, in_flight))
-	if ( !(nc->is_valid) )
+	if ( !(nc->is_valid) && !tcp_is_cwnd_limited(sk, in_flight))
+        //if ( !(nc->is_valid) )
                 return;
 
 	/* The following isi the Reno behaviour */	
@@ -394,11 +401,22 @@ static void tcp_newcwv_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
 static void tcp_newcwv_enter_recovery(struct sock* sk, u32 cwnd_before_recovery){
 	struct newcwv *nc = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
-	u32 pipeack =  my_division( (u32)get_pipeack_variable(nc), (u32)tp->mss_cache);
-	printk("CWVDEBUG_3: strating recovery with pa %u cwnd %u\n", pipeack, cwnd_before_recovery);
+	u32 pipeack;
+	
+	pipeack =  (get_pipeack_variable(nc)==INVALID_PIPEACK_RETURN_VALUE)? 0 : (u32)get_pipeack_variable(nc);
+	// convert bytes to segments
+	pipeack = my_division( pipeack, (u32)tp->mss_cache);
+	
+	printk("CWVDEBUG_3: strating recovery with pa %u cwnd %u sport %u dport %u\n",
+		pipeack, cwnd_before_recovery,
+		convert_16bit_endian(tp->inet_conn.icsk_inet.inet_sport),
+		convert_16bit_endian(tp->inet_conn.icsk_inet.inet_dport));
 	in_recovery = true;
 	
 	tp->snd_cwnd = 	 max(pipeack,nc->prior_in_flight) >> 1;
+	
+	// make sure the min. value for cwnd is 1
+	tp->snd_cwnd = (tp->snd_cwnd < 1)? 1: tp->snd_cwnd;
 	
 	printstat(sk,3,0);
 }
@@ -410,9 +428,15 @@ static void tcp_newcwv_end_recovery(struct sock* sk)
 	struct tcp_sock *tp = tcp_sk(sk);
 	u32 retrans,pipeack;
 	
-	printk("CWVDEBUG_3: ending recovery\n");
+	printk("CWVDEBUG_3: ending recovery sport %u dport %u\n",
+		convert_16bit_endian(tp->inet_conn.icsk_inet.inet_sport),
+		convert_16bit_endian(tp->inet_conn.icsk_inet.inet_dport));
 	printstat(sk,3,0);
-	pipeack =  my_division( (u32)get_pipeack_variable(nc), (u32)tp->mss_cache);
+	
+	pipeack =  (get_pipeack_variable(nc)==INVALID_PIPEACK_RETURN_VALUE)? 0 : (u32)get_pipeack_variable(nc);
+	// convert bytes to segments
+	pipeack = my_division( pipeack, (u32)tp->mss_cache);
+	
 	retrans =  tp->total_retrans - nc->prior_retrans;
 	tp->snd_cwnd = ( max(pipeack,nc->prior_in_flight) - retrans) >> 1;
 	if ( tp->snd_cwnd < TCP_RESTART_WINDOW ) 
@@ -421,8 +445,10 @@ static void tcp_newcwv_end_recovery(struct sock* sk)
 	tp->snd_ssthresh = tp->snd_cwnd;
 	in_recovery = false;
 	
-	printk("CWVDEBUG_3: finished recovery with pr_in_flt: %u total_rxs: %u  pr_rxs: %u\n",
-	       nc->prior_in_flight, tp->total_retrans, nc->prior_retrans);
+	printk("CWVDEBUG_3: finished recovery with pr_in_flt: %u total_rxs: %u  pr_rxs: %u sport %u dport %u\n",
+	       nc->prior_in_flight, tp->total_retrans, nc->prior_retrans,
+	       convert_16bit_endian(tp->inet_conn.icsk_inet.inet_sport),
+	       convert_16bit_endian(tp->inet_conn.icsk_inet.inet_dport));
 	/* restart cwv machine */
 	tcp_newcwv_reset(sk);
 	printstat(sk,3,0);
@@ -437,8 +463,8 @@ static void tcp_newcwv_event(struct sock* sk, enum tcp_ca_event event)
 	
 	switch(event) {
 	  case CA_EVENT_TX_START:
-		//printk("CWVDEBUG_3: START\n");
-		//printstat(sk,3,0);
+		printk("CWVDEBUG_3: START\n");
+		printstat(sk,3,0);
 		datalim_closedown(sk);	
 		break;
 	  
