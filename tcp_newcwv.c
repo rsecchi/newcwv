@@ -1,4 +1,6 @@
-/* method 7: bug fixes with FS of prev. algorithm from my local git*/
+/* method 7: bug fixes with FS of prev. algorithm 
+ * the recovery method updated as well
+ */
  
 #undef __KERNEL__
 #define __KERNEL__
@@ -474,18 +476,20 @@ static void tcp_newcwv_event(struct sock* sk, enum tcp_ca_event event)
 	
           case CA_EVENT_COMPLETE_CWR:
 		printk("CWVDEBUG_3: CWR - end recovery\n");
-		tcp_newcwv_end_recovery(sk);
+		printstat(sk,3,0);
+		if (!nc->is_valid) // set the cwnd according to draft in non_validated period
+			tcp_newcwv_end_recovery(sk);
 		break;
 
 	  case CA_EVENT_FRTO:
 		printk("CWVDEBUG_3: FRTO\n");
-		printstat(sk,3,0);
+		printstat(sk,3,tcp_packets_in_flight(tp));
 		tcp_newcwv_init(sk);
 		break;
 	
 	  case CA_EVENT_LOSS:
 		printk("CWVDEBUG_3: LOSS\n");
-		printstat(sk,3,0);
+		printstat(sk,3,tcp_packets_in_flight(tp));
 		tcp_newcwv_init(sk);
 		break;
 	  
@@ -503,7 +507,9 @@ static void tcp_newcwv_event(struct sock* sk, enum tcp_ca_event event)
 				break;
 			
 			case TCP_CA_Recovery:
-				if (!in_recovery)
+				printk("CWVDEBUG_3: Recovery\n");
+				printstat(sk,3,tcp_packets_in_flight(tp));
+				if (!nc->is_valid && !in_recovery)
 					tcp_newcwv_enter_recovery(sk, nc->cwnd_before_recovery);
 				break;
 			
