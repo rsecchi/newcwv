@@ -2,12 +2,6 @@
  * the recovery method updated as well
  */
  
-#undef __KERNEL__
-#define __KERNEL__
-
-#undef MODULE
-#define MODULE
-
 #include <net/tcp.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -20,7 +14,6 @@
 #include <linux/ipsec.h>
 #include <asm/unaligned.h>
 #include <net/netdma.h>
-
 #include <linux/fs.h>
 #include <asm/segment.h>
 #include <asm/uaccess.h>
@@ -33,15 +26,14 @@
 #define PIPEACK_INIT  			TCP_INFINITE_SSTHRESH
 #define TCP_RESTART_WINDOW		1
 #define FIVEMINS  			(HZ*300)
-#define ONESEC 				HZ
 #define RTT_EST 			1
 #define MAX_NO_OF_BINS			4
 #define INVALID_INDEX			-1
 
-u32 PSP;	/* pipeACK Sampling Period: valid duration of a pipeACK in bin */
-u32 PMP;	/* pipeACK measurement period: bin duration */
-u32 NO_OF_BINS;
-bool in_recovery;
+static u32 PSP;	/* pipeACK Sampling Period: valid duration of a pipeACK in bin */
+static u32 PMP;	/* pipeACK measurement period: bin duration */
+static u32 NO_OF_BINS;
+static bool in_recovery;
 
 
 struct newcwv {
@@ -62,20 +54,18 @@ struct newcwv {
 };
 
 
-static u32 my_division(u32 dividend, u32 divisor){
+static u32 divide_or_zero(u32 dividend, u32 divisor){
 	u32 i=0;
 	if (divisor == 0 )
 		return i;
-	while (divisor < dividend){
-		dividend = dividend - divisor;
-		i++;
-	}
+	else
+		i = (u32)(dividend/divisor);
 	return i;
 }
 
 
 /* this function will add an element to the Linked list of pipeack samples and return the new element pointer */
-void add_element(struct newcwv *nc, int32_t val){
+static void add_element(struct newcwv *nc, int32_t val){
 	//array is full; this entry will overwrite the prev. value;advance head
 	//printk("CWVDEBUG_9: add A : head %d   tail %d\n", nc->head,nc->tail);
 	if ( nc->head == ((nc->tail+1) % MAX_NO_OF_BINS) )  
@@ -99,7 +89,7 @@ void add_element(struct newcwv *nc, int32_t val){
 	time_stamp  = the time stamp of the last element
 	next = the pointer to the last element
 	*/
-int32_t remove_expired_element_and_return_pipeack_element(struct newcwv *nc){
+static int32_t remove_expired_element_and_return_pipeack_element(struct newcwv *nc){
 	
 	int32_t tmp_pa = nc->pipeack_variable;
 	bool changed = false;
@@ -156,7 +146,7 @@ static int32_t get_pipeack_value(struct newcwv *nc){
 */
 
 /* 	returns the usable pipeack value*/
-int32_t get_pipeack_variable( struct newcwv* nc){
+static int32_t get_pipeack_variable( struct newcwv* nc){
 	return (nc->pipeack_variable == INVALID_PIPEACK_VALUE)? INVALID_PIPEACK_RETURN_VALUE : nc->pipeack_variable;
 }
 
@@ -170,8 +160,9 @@ static void printpipeack(struct newcwv *nc){
 }
 */
 
+
 /* print all the values in the linked list */
-void print_pipeack_array(struct newcwv *nc){
+/*static void print_pipeack_array(struct newcwv *nc){
 	int i;
 	printk ("CWVDEBUG_9: ");
 	for(i=0; i< MAX_NO_OF_BINS;i++){
@@ -182,7 +173,8 @@ void print_pipeack_array(struct newcwv *nc){
 		printk ("%u  ", nc->time_stamp[i]);
 	}
 	printk("\n");
-}
+}*/
+
 
 static inline u16 convert_16bit_endian (u16 value){
 	return ((value << 8) | ((value >> 8) & 0x00FF) );
@@ -250,14 +242,14 @@ static void calculate_params(u32 srtt){
 	// update PSP, PMP, no_of_bins from srtt
 	u32 bin;
 	u32 rtt = srtt >> 3;
-	PSP = max ( 3*rtt , (u32)ONESEC);
-	bin =  my_division ( PSP , rtt );
+	PSP = max ( 3*rtt , (u32)HZ);
+	bin =  divide_or_zero ( PSP , rtt );
 	if (bin==0) bin=1;
 	if (bin < MAX_NO_OF_BINS)
 		NO_OF_BINS =  bin;
 	else 
 		NO_OF_BINS = MAX_NO_OF_BINS; //ensure minimum value 1 and maximum value 5
-	PMP = my_division ( PSP, NO_OF_BINS );
+	PMP = divide_or_zero ( PSP, NO_OF_BINS );
 }
 
 
@@ -375,7 +367,7 @@ static void tcp_newcwv_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
 	nc->prior_in_flight = in_flight;
 	nc->prior_retrans = tp->total_retrans;
 
-	printk("write_zia %u\n",tp->write_seq);
+	//printk("write_zia %u\n",tp->write_seq);
 	
 	update_pipeack(sk);
 
@@ -407,7 +399,7 @@ static void tcp_newcwv_enter_recovery(struct sock* sk, u32 cwnd_before_recovery)
 	
 	pipeack =  (get_pipeack_variable(nc)==INVALID_PIPEACK_RETURN_VALUE)? 0 : (u32)get_pipeack_variable(nc);
 	// convert bytes to segments
-	pipeack = my_division( pipeack, (u32)tp->mss_cache);
+	pipeack = divide_or_zero( pipeack, (u32)tp->mss_cache);
 	
 	printk("CWVDEBUG_3: strating recovery with pa %u cwnd %u sport %u dport %u\n",
 		pipeack, cwnd_before_recovery,
@@ -437,7 +429,7 @@ static void tcp_newcwv_end_recovery(struct sock* sk)
 	
 	pipeack =  (get_pipeack_variable(nc)==INVALID_PIPEACK_RETURN_VALUE)? 0 : (u32)get_pipeack_variable(nc);
 	// convert bytes to segments
-	pipeack = my_division( pipeack, (u32)tp->mss_cache);
+	pipeack = divide_or_zero( pipeack, (u32)tp->mss_cache);
 	
 	retrans =  tp->total_retrans - nc->prior_retrans;
 	tp->snd_cwnd = ( max(pipeack,nc->prior_in_flight) - retrans) >> 1;
@@ -481,12 +473,6 @@ static void tcp_newcwv_event(struct sock* sk, enum tcp_ca_event event)
 			tcp_newcwv_end_recovery(sk);
 		break;
 
-	  case CA_EVENT_FRTO:
-		printk("CWVDEBUG_3: FRTO\n");
-		printstat(sk,3,tcp_packets_in_flight(tp));
-		tcp_newcwv_init(sk);
-		break;
-	
 	  case CA_EVENT_LOSS:
 		printk("CWVDEBUG_3: LOSS\n");
 		printstat(sk,3,tcp_packets_in_flight(tp));
