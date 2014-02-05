@@ -5,13 +5,11 @@
 #include <linux/module.h>
 #include <net/tcp.h>
 
-#define INVALID_PIPEACK 		-1
 #define UNDEF_PIPEACK 	                -1
 #define PIPEACK_INIT  			TCP_INFINITE_SSTHRESH
 #define TCP_RESTART_WINDOW		1
 #define FIVEMINS  			(HZ*300)
 #define RTT_EST 			1
-
 #define INVALID_INDEX			-1
 #define NO_OF_BINS                      4
 #define IS_VALID                        0x0002
@@ -19,19 +17,19 @@
 #define nextbin(x)  (((x)+1) % NO_OF_BINS)
 
 struct newcwv {
-	int psample[NO_OF_BINS];    /* pipeACK samples collected every PMP */
-	u32 time_stamp[NO_OF_BINS]; /* pipeACK sample timestamps */ 
-	int pipeack;		    /* pipeACK value after filtering */
+	int psample[NO_OF_BINS];	/* pipeACK samples collected every PMP */
+	u32 time_stamp[NO_OF_BINS];	/* pipeACK sample timestamps */
+	int pipeack;		/* pipeACK value after filtering */
 
-	u8 head, tail;              /* indexes for psample array */ 
-	u16 flags;                  
+	u8 head, tail;		/* indexes for psample array */
+	u16 flags;
 
 	u32 prior_in_flight;	/* Packets in flight for cwnd reduction */
 	u32 prior_retrans;	/* Retransmission before going into FR */
 	u32 prev_snd_una;	/* snd_una when last record kept */
 	u32 prev_snd_nxt;	/* snd_una when last record kept */
 	u32 cwnd_valid_ts;	/* last time cwnd was found 'validated' */
-	u32 psp;		/* pipeACK Sampling Period (see Internet draft) */
+	u32 psp;		/* pipeACK Sampling Period */
 };
 
 /* helper function for division */
@@ -43,10 +41,7 @@ static u32 divide_or_zero(u32 dividend, u32 divisor)
 		return (u32) (dividend / divisor);
 }
 
-/* 
- * This function adds an element to the linked list of pipeack samples 
- * and returns the new element pointer
- */
+/* This function adds an element to the circular buffer of pipeack samples */
 static void add_element(struct newcwv *nc, int val)
 {
 	if (nc->head == nextbin(nc->tail))
@@ -63,29 +58,26 @@ static void add_element(struct newcwv *nc, int val)
 }
 
 /* 
- * This fuction removes all the expired elements based on their time_stamp
- * and return a pipeack element: value = the maximum from the remaining
- * elements time_stamp  = the time stamp of the last element
- * next = the pointer to the last element
+ * This fuction removes all the expired elements from the circular buffer
+ * and returns the maximum from the remaining elements
  */
 static int remove_expired_element(struct newcwv *nc)
 {
-
 	int tmp_pa = nc->pipeack;
 	bool changed = false;
 	short tmp1;
 
 	if (nc->head == INVALID_INDEX)
-		return INVALID_PIPEACK;
+		return UNDEF_PIPEACK;
 
 	while (nc->time_stamp[nc->head] < (tcp_time_stamp - nc->psp)) {
 		changed = true;
-		nc->psample[nc->head] = INVALID_PIPEACK;
+		nc->psample[nc->head] = UNDEF_PIPEACK;
 		nc->time_stamp[nc->tail] = 0;
 
 		if (nc->tail == nc->head) {
 			nc->head = nc->tail = INVALID_INDEX;
-			return INVALID_PIPEACK;
+			return UNDEF_PIPEACK;
 		} else
 			nc->head = nextbin(nc->head);
 	}
@@ -99,13 +91,6 @@ static int remove_expired_element(struct newcwv *nc)
 		}
 	}
 	return tmp_pa;
-}
-
-/* returns the pipeack value */
-static int get_pipeack_variable(struct newcwv *nc)
-{
-	return (nc->pipeack ==
-		INVALID_PIPEACK) ? UNDEF_PIPEACK : nc->pipeack;
 }
 
 /* Is TCP in the validated phase? */
@@ -155,6 +140,8 @@ static void update_pipeack(struct sock *sk)
 	nc->pipeack = remove_expired_element(nc);
 
 	if (tp->snd_una >= nc->prev_snd_nxt) {
+
+		/* Time to get a new pipeack sample */
 		tmp_pipeack = tp->snd_una - nc->prev_snd_una;
 		nc->prev_snd_una = tp->snd_una;
 		nc->prev_snd_nxt = tp->snd_nxt;
@@ -171,21 +158,21 @@ static void update_pipeack(struct sock *sk)
 				add_element(nc, tmp_pipeack);
 
 		/* Maximum filter (see Internet draft) */
-		if (tmp_pipeack > nc->pipeack) {
-			nc->pipeack = tmp_pipeack;
+		if (tmp_pipeack > nc->psample[nc->tail]) {
 			nc->psample[nc->tail] = tmp_pipeack;
+			if (tmp_pipeack > nc->pipeack)
+				nc->pipeack = tmp_pipeack;
 		}
 	}
 
 	/* Check if cwnd is validated */
-	if (tcp_is_in_vp(tp, get_pipeack_variable(nc))) {
+	if (tcp_is_in_vp(tp, nc->pipeack)) {
 		nc->flags |= IS_VALID;
 		nc->cwnd_valid_ts = tcp_time_stamp;
 	} else {
 		nc->flags &= ~IS_VALID;
 		datalim_closedown(sk);
 	}
-
 }
 
 /* initialise newcwv variables */
@@ -206,10 +193,10 @@ static void tcp_newcwv_init(struct sock *sk)
 	nc->head = INVALID_INDEX;
 	nc->tail = INVALID_INDEX;
 	for (i = 0; i < NO_OF_BINS; i++) {
-		nc->psample[i] = INVALID_PIPEACK;
+		nc->psample[i] = UNDEF_PIPEACK;
 		nc->time_stamp[i] = 0;
 	}
-	nc->pipeack = INVALID_PIPEACK;
+	nc->pipeack = UNDEF_PIPEACK;
 }
 
 
@@ -228,8 +215,7 @@ static void tcp_newcwv_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
 	if (!(nc->flags & IS_VALID) && !tcp_is_cwnd_limited(sk, in_flight))
 		return;
 
-	/* The following isi the Reno behaviour */
-	/* NB: ABC (RFC 3465) was disabled */
+	/* The following is the Reno behaviour */
 
 	/* In "safe" area, increase. */
 	if (tp->snd_cwnd <= tp->snd_ssthresh)
@@ -250,8 +236,8 @@ static void tcp_newcwv_enter_recovery(struct sock *sk)
 
 	nc->flags |= IS_RECOVERY;
 
-	pipeack = (get_pipeack_variable(nc) == UNDEF_PIPEACK) ? 0 : (u32)
-	    get_pipeack_variable(nc);
+	pipeack = (nc->pipeack == UNDEF_PIPEACK) ? 0 : (u32)
+	    nc->pipeack;
 
 	pipeack = divide_or_zero(pipeack, (u32) tp->mss_cache);
 
@@ -269,8 +255,8 @@ static void tcp_newcwv_end_recovery(struct sock *sk)
 	struct tcp_sock *tp = tcp_sk(sk);
 	u32 retrans, pipeack;
 
-	pipeack = (get_pipeack_variable(nc) == UNDEF_PIPEACK) ? 0 : (u32)
-	    get_pipeack_variable(nc);
+	pipeack = (nc->pipeack == UNDEF_PIPEACK) ? 0 : (u32)
+	    nc->pipeack;
 
 	/* converts bytes to segments */
 	pipeack = divide_or_zero(pipeack, (u32) tp->mss_cache);
@@ -299,9 +285,6 @@ static void tcp_newcwv_event(struct sock *sk, enum tcp_ca_event event)
 		datalim_closedown(sk);
 		break;
 
-	case CA_EVENT_CWND_RESTART:
-		break;
-
 	case CA_EVENT_COMPLETE_CWR:
 		if (!(nc->flags & IS_VALID))
 			tcp_newcwv_end_recovery(sk);
@@ -328,6 +311,7 @@ static void tcp_newcwv_event(struct sock *sk, enum tcp_ca_event event)
 		}
 		break;
 
+	case CA_EVENT_CWND_RESTART:
 	case CA_EVENT_FAST_ACK:
 		break;
 
@@ -348,11 +332,9 @@ struct tcp_congestion_ops tcp_newcwv = {
 	.min_cwnd = tcp_reno_min_cwnd,
 };
 
-
 /* newcwv registered as congestion control in Linux */
 static int __init tcp_newcwv_register(void)
 {
-
 	BUILD_BUG_ON(sizeof(struct newcwv) > ICSK_CA_PRIV_SIZE);
 	tcp_register_congestion_control(&tcp_newcwv);
 
