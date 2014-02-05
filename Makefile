@@ -1,7 +1,7 @@
 obj-m := tcp_newcwv.o
 
 
-KDIR := ../../linux-3.8.2
+KDIR := /home/raffaello/virtualbox/ubuntu-precise/
 
 PWD := $(shell pwd)
 
