@@ -108,7 +108,7 @@ static void update_pipeack(struct sock *sk)
 {
 	struct newcwv *nc = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
-	int tmp_pipeack = 0;
+	int tmp_pipeack;
 
 	nc->psp = max(3 * (tp->srtt >> 3), (u32) HZ);
 
@@ -121,7 +121,9 @@ static void update_pipeack(struct sock *sk)
 
 		/* create a new element at the end of current pmp */
 		if (tcp_time_stamp > nc->time_stamp[nc->head] + (nc->psp >> 2))
-				add_element(nc, tmp_pipeack);
+			add_element(nc, tmp_pipeack);
+		else if (tmp_pipeack > nc->psample[nc->head])
+			nc->psample[nc->head] = tmp_pipeack;
 	}
 
 	nc->pipeack = remove_expired_element(nc);
