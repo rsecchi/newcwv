@@ -1,5 +1,5 @@
 /*
- * New-CWV implementation for Linux: draft-ietf-tcpm-newcwv-04.txt
+ * New-CWV implementation for Linux: draft-ietf-tcpm-newcwv-05.txt
  */
 
 #include <linux/module.h>
@@ -141,7 +141,6 @@ static void update_pipeack(struct sock *sk)
 /* initialises newcwv variables */
 static void tcp_newcwv_init(struct sock *sk)
 {
-	int i;
 	struct newcwv *nc = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
 
@@ -272,12 +271,24 @@ static void tcp_newcwv_event(struct sock *sk, enum tcp_ca_event event)
 
 }
 
+/* Slow start threshold resetting after loss */
+u32 tcp_newcwv_ssthresh(struct sock *sk)
+{
+	const struct tcp_sock *tp = tcp_sk(sk);
+
+	/* This is tcp_packets_in_flight */
+	u32 prior_in_flight =
+	    tp->packets_out - tp->sacked_out - tp->lost_out + tp->retrans_out;
+
+	return max(prior_in_flight >> 1U, 2U);
+}
+
 struct tcp_congestion_ops tcp_newcwv = {
 	.flags = TCP_CONG_NON_RESTRICTED,
 	.name = "newcwv",
 	.init = tcp_newcwv_init,
 	.owner = THIS_MODULE,
-	.ssthresh = tcp_reno_ssthresh,
+	.ssthresh = tcp_newcwv_ssthresh,
 	.cong_avoid = tcp_newcwv_cong_avoid,
 	.cwnd_event = tcp_newcwv_event,
 	.min_cwnd = tcp_reno_min_cwnd,
