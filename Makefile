@@ -11,4 +11,10 @@ all:
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 
+push: all
+	cp tcp_newcwv.ko /usr/src/WM_with_TMIX/
+	cd /usr/src/WM_with_TMIX/; ./makefs
+
+indent:
+	indent -npro -kr -i8 -ts8 -sob -l80 -ss -ncs -cp1 tcp_newcwv.c
 
