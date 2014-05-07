@@ -1,5 +1,5 @@
 diff --git a/include/linux/tcp.h b/include/linux/tcp.h
-index 2399468..d8a00a04 100644
+index 2399468..fb82343 100644
 --- a/include/linux/tcp.h
 +++ b/include/linux/tcp.h
 @@ -323,6 +323,19 @@ struct tcp_sock {
@@ -13,10 +13,10 @@ index 2399468..d8a00a04 100644
 +	u32 head;		/* index for psample buffer */
 +
 +	u32 pipeack;		/* pipeACK value after filtering */
-+	u32 loss_flight_size;	/* pipeACK value after filtering */
++	u32 loss_flight_size;	/* flightsize at loss detection */
 +	u32 prior_retrans;	/* Retransmission before going into FR */
-+	u32 prev_snd_una;	/* snd_una when last record kept */
-+	u32 prev_snd_nxt;	/* snd_nxt when last record kept */
++	u32 prev_snd_una;	/* snd_una of last record */
++	u32 prev_snd_nxt;	/* snd_nxt of last record */
 +	u32 cwnd_valid_ts;	/* last time cwnd was found valid */
 +
  };
@@ -135,7 +135,7 @@ index 2b9464c..6fb0719 100644
  	left = tp->snd_cwnd - in_flight;
  	if (sk_can_gso(sk) &&
 diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
-index d6b46eb..d076122 100644
+index d6b46eb..cf5675c 100644
 --- a/net/ipv4/tcp_input.c
 +++ b/net/ipv4/tcp_input.c
 @@ -1927,6 +1927,7 @@ void tcp_enter_loss(struct sock *sk, int how)
@@ -146,21 +146,24 @@ index d6b46eb..d076122 100644
  
  	tcp_clear_retrans_partial(tp);
  
-@@ -2522,7 +2523,13 @@ static inline void tcp_end_cwnd_reduction(struct sock *sk)
+@@ -2522,7 +2523,16 @@ static inline void tcp_end_cwnd_reduction(struct sock *sk)
  	    (tp->undo_marker && tp->snd_ssthresh < TCP_INFINITE_SSTHRESH)) {
  		tp->snd_cwnd = tp->snd_ssthresh;
  		tp->snd_cwnd_stamp = tcp_time_stamp;
-+
++	
 +		/* draft-ietf-tcpm-newcwv actions at the end of recovery */
-+		if (sysctl_tcp_newcwv && tp->loss_flight_size)
-+			tcp_newcwv_end_recovery(sk);
++		if (sysctl_tcp_newcwv) {
++			if (tp->loss_flight_size)
++				tcp_newcwv_end_recovery(sk);
++			tcp_newcwv_reset(sk);
++		}
  	}
 +	tp->loss_flight_size = 0;
 +
  	tcp_ca_event(sk, CA_EVENT_COMPLETE_CWR);
  }
  
-@@ -2666,11 +2673,17 @@ static void tcp_enter_recovery(struct sock *sk, bool ece_ack)
+@@ -2666,6 +2676,11 @@ static void tcp_enter_recovery(struct sock *sk, bool ece_ack)
  	tp->undo_marker = tp->snd_una;
  	tp->undo_retrans = tp->retrans_out;
  
@@ -172,13 +175,7 @@ index d6b46eb..d076122 100644
  	if (inet_csk(sk)->icsk_ca_state < TCP_CA_CWR) {
  		if (!ece_ack)
  			tp->prior_ssthresh = tcp_current_ssthresh(sk);
- 		tcp_init_cwnd_reduction(sk, true);
- 	}
-+
- 	tcp_set_ca_state(sk, TCP_CA_Recovery);
- }
- 
-@@ -3450,6 +3463,11 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
+@@ -3450,6 +3465,11 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
  				    sack_rtt_us);
  	acked -= tp->packets_out;
  
@@ -192,12 +189,12 @@ index d6b46eb..d076122 100644
  		tcp_cong_avoid(sk, ack, acked, prior_in_flight);
 diff --git a/net/ipv4/tcp_newcwv.c b/net/ipv4/tcp_newcwv.c
 new file mode 100644
-index 0000000..a621e8b
+index 0000000..e56fab0
 --- /dev/null
 +++ b/net/ipv4/tcp_newcwv.c
 @@ -0,0 +1,142 @@
 +/*
-+ * New-CWV implementation for Linux: draft-ietf-tcpm-newcwv-05.txt
++ * New-CWV implementation for Linux: draft-ietf-tcpm-newcwv.txt
 + */
 +
 +#include <linux/module.h>
@@ -244,7 +241,7 @@ index 0000000..a621e8b
 +		/* remove expired */
 +		if (tp->time_stamp[k] < tcp_time_stamp - psp) {
 +			tp->psample[k] = NCWV_UNDEF;
-+			return tmp;
++			continue;
 +		}
 +
 +		/* search the maximum */
@@ -263,9 +260,9 @@ index 0000000..a621e8b
 +void tcp_newcwv_update_pipeack(struct sock *sk)
 +{
 +	struct tcp_sock *tp = tcp_sk(sk);
-+	u32 tmp_pipeack, psp;
++	u32 tmp_pipeack, psp, h;
 +
-+	psp = max_t(u32, 3*(tp->srtt_us>>3), (u32) HZ);
++	psp = max_t(u32, 3*usecs_to_jiffies(tp->srtt_us>>3), (u32) HZ);
 +
 +	if (tp->snd_una >= tp->prev_snd_nxt) {
 +
@@ -274,16 +271,19 @@ index 0000000..a621e8b
 +		tp->prev_snd_una = tp->snd_una;
 +		tp->prev_snd_nxt = tp->snd_nxt;
 +
++		h = tp->head;
++
 +		/* create a new element at the end of current pmp */
-+		if (tcp_time_stamp > tp->time_stamp[tp->head] + (psp >> 2)) {
++		if (tp->psample[h] == NCWV_UNDEF ||
++		    tcp_time_stamp > tp->time_stamp[h] + (psp >> 2)) {
 +
 +			/* Add an element to circular the buffer */
-+			tp->head = nextbin(tp->head);
++			tp->head = nextbin(h);
 +			tp->psample[tp->head] = tmp_pipeack;
 +			tp->time_stamp[tp->head] = tcp_time_stamp;
 +
-+		} else if (tmp_pipeack > tp->psample[tp->head])
-+			tp->psample[tp->head] = tmp_pipeack;
++		} else if (tmp_pipeack > tp->psample[h])
++			tp->psample[h] = tmp_pipeack;
 +	}
 +
 +	tp->pipeack = remove_expired_element(tp, psp);
@@ -303,7 +303,6 @@ index 0000000..a621e8b
 +
 +	pipe =  max_t(u32, pa_pkts(tp), tp->loss_flight_size);
 +	tp->snd_cwnd = max_t(u32, pipe >> 1, 1UL);
-+
 +}
 +
 +/* newcwv actions at the end of recovery */
@@ -316,8 +315,6 @@ index 0000000..a621e8b
 +	pipe = max_t(u32, pa_pkts(tp), tp->loss_flight_size) - retrans;
 +	tp->snd_ssthresh = max_t(u32, pipe >> 1, 1UL);
 +	tp->snd_cwnd = tp->snd_ssthresh;
-+
-+	tcp_newcwv_reset(sk);
 +}
 +
 +
@@ -326,7 +323,7 @@ index 0000000..a621e8b
 +{
 +	struct tcp_sock *tp = tcp_sk(sk);
 +
-+	while ((tcp_time_stamp -  tp->cwnd_valid_ts) > NCWV_FIVEMINS &&
++	while ((tcp_time_stamp -  tp->cwnd_valid_ts) > NCWV_FIVEMINS && 
 +		tp->snd_cwnd > TCP_INIT_CWND) {
 +		tp->cwnd_valid_ts += NCWV_FIVEMINS;
 +
@@ -339,7 +336,7 @@ index 0000000..a621e8b
 +
 +
 diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
-index 025e250..b601e4e 100644
+index 12d6016..e868211 100644
 --- a/net/ipv4/tcp_output.c
 +++ b/net/ipv4/tcp_output.c
 @@ -168,6 +168,9 @@ static void tcp_event_data_sent(struct tcp_sock *tp,
