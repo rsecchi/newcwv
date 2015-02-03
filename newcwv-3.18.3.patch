@@ -23,7 +23,7 @@ index c2dee7d..a06896e 100644
  
  enum tsq_flags {
 diff --git a/include/net/tcp.h b/include/net/tcp.h
-index 4062b4f..5e529bd 100644
+index 4062b4f..554909e 100644
 --- a/include/net/tcp.h
 +++ b/include/net/tcp.h
 @@ -228,6 +228,10 @@ void tcp_time_wait(struct sock *sk, int state, int timeo);
@@ -45,7 +45,7 @@ index 4062b4f..5e529bd 100644
  
  extern atomic_long_t tcp_memory_allocated;
  extern struct percpu_counter tcp_sockets_allocated;
-@@ -995,29 +1000,7 @@ static inline u32 tcp_wnd_end(const struct tcp_sock *tp)
+@@ -995,28 +1000,20 @@ static inline u32 tcp_wnd_end(const struct tcp_sock *tp)
  	return tp->snd_una + tp->snd_wnd;
  }
  
@@ -63,20 +63,29 @@ index 4062b4f..5e529bd 100644
 - * usage, and allow application-limited process to probe bw more aggressively.
 - */
 -static inline bool tcp_is_cwnd_limited(const struct sock *sk)
--{
++static inline bool tcp_is_cwnd_limited(struct sock *sk)
+ {
 -	const struct tcp_sock *tp = tcp_sk(sk);
--
+ 
 -	/* If in slow start, ensure cwnd grows to twice what was ACKed. */
 -	if (tp->snd_cwnd <= tp->snd_ssthresh)
 -		return tp->snd_cwnd < 2 * tp->max_packets_out;
--
++	struct tcp_sock *tp = tcp_sk(sk);
++
++        /* draft-ietf-tcpm-newcwv relaxes conditions for growing cwnd */
++        if (tcp_packets_in_flight(tp) >= tp->snd_cwnd || 
++		(sysctl_tcp_newcwv && 
++		  tp->pipeack >= (tp->snd_cwnd*tp->mss_cache >> 1))) {
++               tp->cwnd_valid_ts = tcp_time_stamp;
++               return true;
++	}
+ 
 -	return tp->is_cwnd_limited;
--}
-+bool tcp_is_cwnd_limited(struct sock *sk);
++	return false;
+ }
  
  static inline void tcp_check_probe_timer(struct sock *sk)
- {
-@@ -1366,6 +1349,13 @@ struct tcp_fastopen_context {
+@@ -1366,6 +1363,13 @@ struct tcp_fastopen_context {
  	struct rcu_head		rcu;
  };
  
@@ -122,7 +131,7 @@ index b3c53c8..ca686ac 100644
  		.data		= &sysctl_tcp_reordering,
  		.maxlen		= sizeof(int),
 diff --git a/net/ipv4/tcp_cong.c b/net/ipv4/tcp_cong.c
-index b1c5970..b97ad0c 100644
+index b1c5970..980122b 100644
 --- a/net/ipv4/tcp_cong.c
 +++ b/net/ipv4/tcp_cong.c
 @@ -103,6 +103,9 @@ void tcp_init_congestion_control(struct sock *sk)
@@ -135,25 +144,10 @@ index b1c5970..b97ad0c 100644
  	if (icsk->icsk_ca_ops->init)
  		icsk->icsk_ca_ops->init(sk);
  }
-@@ -282,6 +285,22 @@ int tcp_set_congestion_control(struct sock *sk, const char *name)
+@@ -282,6 +285,7 @@ int tcp_set_congestion_control(struct sock *sk, const char *name)
  	return err;
  }
  
-+bool tcp_is_cwnd_limited(struct sock *sk)
-+{
-+
-+	const struct tcp_sock *tp = tcp_sk(sk);
-+
-+        /* draft-ietf-tcpm-newcwv relaxes conditions for growing cwnd */
-+        if (tcp_packets_in_flight(tp) >= tp->snd_cwnd || 
-+		(sysctl_tcp_newcwv && 
-+		  tp->pipeack >= (tp->snd_cwnd*tp->mss_cache >> 1))) {
-+               tp->cwnd_valid_ts = tcp_time_stamp;
-+               return true;
-+	}
-+
-+	return false;
-+}
 +
  /* Slow start is used when congestion window is no greater than the slow start
   * threshold. We base on RFC2581 and also handle stretch ACKs properly.
@@ -213,10 +207,10 @@ index d107ee2..47afa26 100644
  		tcp_cong_avoid(sk, ack, acked);
 diff --git a/net/ipv4/tcp_newcwv.c b/net/ipv4/tcp_newcwv.c
 new file mode 100644
-index 0000000..e56fab0
+index 0000000..65a0cba
 --- /dev/null
 +++ b/net/ipv4/tcp_newcwv.c
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,143 @@
 +/*
 + * New-CWV implementation for Linux: draft-ietf-tcpm-newcwv.txt
 + */
@@ -228,6 +222,7 @@ index 0000000..e56fab0
 +#define prevbin(x)  (((x)-1) & 0x03)
 +
 +int sysctl_tcp_newcwv __read_mostly = 0;
++EXPORT_SYMBOL(sysctl_tcp_newcwv);
 +
 +/* returns pipeack in MSSs */
 +static u32 pa_pkts(struct tcp_sock* tp)
