@@ -2,11 +2,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <semaphore.h>
+#include <netinet/tcp.h>
 
 #define min(x,y)   ((x)<(y))?(x):(y)
 #define MAX_TRSF 20000
@@ -25,8 +27,13 @@ void error(const char *msg)
 
 void bind_socket(int port_no)
 {
+	int opt_nodelay = 1;
+
 	sockfd = socket(AF_INET, SOCK_STREAM, 0);
 
+	setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, 
+			(void*)&opt_nodelay, 
+			sizeof(opt_nodelay));
 	//setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (char *)&win, sizeof(win));
 	if (sockfd < 0)
 		error("ERROR opening socket");
@@ -48,12 +55,12 @@ void send_burst(int sock, char* buffer, int size)
 
 		n = write(sock, buffer, min(size-sent,MAX_TRSF));
 		if (n < 0) {
-			error("ERROR writing to socket");
-			exit(1);
+			fprintf(stderr, "write interrupted, bail out\n");
+			return;
 		}
 	
 	}
-	// printf("Burst sent: %d B\n", sent);
+	printf("Burst sent: %d B\n", sent);
 
 }
 
@@ -77,8 +84,8 @@ int receive_and_send(int sock)
 
 	datalen = ntohl(*(uint32_t*)buffer);
 	resp_size = ntohl(*(uint32_t*)(buffer+sizeof(int)));
-	// printf("Request size %d B\n", datalen);
-	// printf("Sending Response: %d B\n", resp_size);
+	printf("Request size %d B\n", datalen);
+	printf("Sending Response: %d B\n", resp_size);
 
 	/* reads the request */
 	for(n=0; n<datalen; )
@@ -107,7 +114,8 @@ int main(int argc, char *argv[])
         socklen_t clilen;
 	pthread_t ntp;
        	int fd;
-	 
+	
+	signal(SIGPIPE, SIG_IGN); 
 	bind_socket(PORT);
 	listen(sockfd, 5);
        
